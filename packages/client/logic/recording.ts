@@ -1,10 +1,15 @@
+import { getSeekableBlob } from 'recordrtc'
 import type { Ref } from 'vue'
 import { nextTick, ref, shallowRef, watch } from 'vue'
 import { useDevicesList, useEventListener } from '@vueuse/core'
 import { isTruthy } from '@antfu/utils'
 import type RecorderType from 'recordrtc'
 import type { Options as RecorderOptions } from 'recordrtc'
+// @ts-expect-error: waiting for v2.0.2 to be available to have .d.ts files: https://github.com/jimmywarting/native-file-system-adapter/issues/27
+import { showSaveFilePicker } from 'native-file-system-adapter'
 import { currentCamera, currentMic } from '../state'
+
+import 'recordrtc-github/libs/EBML'
 
 export const recordingName = ref('')
 export const recordCamera = ref(true)
@@ -20,7 +25,6 @@ export function getFilename(media?: string) {
 }
 
 export const {
-  devices,
   videoInputs: cameras,
   audioInputs: microphones,
   ensurePermissions: ensureDevicesListPermissions,
@@ -58,8 +62,7 @@ export function useRecording() {
   const config: RecorderOptions = {
     type: 'video',
     bitsPerSecond: 4 * 256 * 8 * 1024,
-    // Extending recording limit as default is only 1h (see https://github.com/muaz-khan/RecordRTC/issues/144)
-    timeSlice: 24 * 60 * 60 * 1000,
+    timeSlice: 1000,
   }
 
   async function toggleAvatar() {
@@ -115,7 +118,37 @@ export function useRecording() {
     }
   })
 
+  async function getFileHandle(fileName: string) {
+    return await showSaveFilePicker({
+      excludeAcceptAllOption: true,
+      suggestedName: fileName,
+      types: [{
+        description: 'WEBM video',
+        accept: { 'video/webm': ['.webm'] },
+      }],
+    })
+  }
+
+  function makeSeekable(fileHandle) {
+    return async function() {
+      const file = await fileHandle.getFile()
+      const blob = file.slice()
+
+      getSeekableBlob(blob, async(seekableBlob) => {
+        const rewriteStream = await fileHandle.createWritable()
+        await rewriteStream.write(seekableBlob)
+        await rewriteStream.close()
+      })
+    }
+  }
+
   async function startRecording() {
+    // Starting by getting file handles as otherwise browser could refuse if it's triggered after a long time after a click
+    let cameraFileHandle
+    if (recordCamera.value)
+      cameraFileHandle = await getFileHandle(getFilename('camera'))
+    const screenFileHandle = await getFileHandle(getFilename('screen'))
+
     await ensureDevicesListPermissions()
     const { default: Recorder } = await import('recordrtc')
     await startCameraStream()
@@ -137,16 +170,28 @@ export function useRecording() {
       if (audioTrack)
         streamSlides.value!.addTrack(audioTrack)
 
-      recorderCamera.value = new Recorder(
-        streamCamera.value!,
-        config,
-      )
-      recorderCamera.value.startRecording()
+      if (recordCamera.value && cameraFileHandle) {
+        recorderCamera.value = new Recorder(
+          streamCamera.value!,
+          {
+            ...config,
+            // @ts-expect-error missing types
+            writableStream: await cameraFileHandle.createWritable(),
+            onWritableStreamClosed: makeSeekable(cameraFileHandle),
+          },
+        )
+        recorderCamera.value.startRecording()
+      }
     }
 
     recorderSlides.value = new Recorder(
       streamSlides.value!,
-      config,
+      {
+        ...config,
+        // @ts-expect-error missing types
+        writableStream: await screenFileHandle.createWritable(),
+        onWritableStreamClosed: makeSeekable(screenFileHandle),
+      },
     )
 
     recorderSlides.value.startRecording()
@@ -156,21 +201,11 @@ export function useRecording() {
   async function stopRecording() {
     recording.value = false
     recorderCamera.value?.stopRecording(() => {
-      if (recordCamera.value) {
-        const blob = recorderCamera.value!.getBlob()
-        const url = URL.createObjectURL(blob)
-        download(getFilename('camera'), url)
-        window.URL.revokeObjectURL(url)
-      }
       recorderCamera.value = undefined
       if (!showAvatar.value)
         closeStream(streamCamera)
     })
     recorderSlides.value?.stopRecording(() => {
-      const blob = recorderSlides.value!.getBlob()
-      const url = URL.createObjectURL(blob)
-      download(getFilename('screen'), url)
-      window.URL.revokeObjectURL(url)
       closeStream(streamSlides)
       recorderSlides.value = undefined
     })
@@ -187,13 +222,6 @@ export function useRecording() {
     stream.value = undefined
   }
 
-  function toggleRecording() {
-    if (recording.value)
-      stopRecording()
-    else
-      startRecording()
-  }
-
   useEventListener('beforeunload', (event) => {
     if (!recording.value)
       return
@@ -207,7 +235,6 @@ export function useRecording() {
   return {
     recording,
     showAvatar,
-    toggleRecording,
     startRecording,
     stopRecording,
     toggleAvatar,
